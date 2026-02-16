@@ -1,0 +1,297 @@
+import asyncio
+import logging
+import re
+import time
+from dataclasses import dataclass
+
+from google import genai
+from google.genai import errors, types
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GeminiResult:
+    text: str
+    model: str
+
+
+class GeminiQuotaError(RuntimeError):
+    pass
+
+
+class GeminiService:
+    AUTO_MODEL = "auto"
+    DEFAULT_AUTO_MODELS = [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemma-3-4b-it",
+    ]
+
+    def __init__(self, api_key: str, fallback_models: list[str] | None = None) -> None:
+        self.client = genai.Client(api_key=api_key)
+        self.fallback_models = [
+            self._normalize_model_name(item)
+            for item in (fallback_models or [])
+            if self._normalize_model_name(item)
+        ]
+        self._available_models: set[str] | None = None
+        self._list_lock = asyncio.Lock()
+        self._cooldown_until: dict[str, float] = {}
+
+    async def generate_from_messages(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        system_instruction: str | None,
+        max_output_tokens: int,
+        temperature: float,
+        allow_fallbacks: bool = True,
+    ) -> GeminiResult:
+        prompt = self._messages_to_prompt(messages)
+        return await self.generate_text(
+            model=model,
+            prompt=prompt,
+            system_instruction=system_instruction,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+            allow_fallbacks=allow_fallbacks,
+        )
+
+    async def generate_text(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        system_instruction: str | None,
+        max_output_tokens: int,
+        temperature: float,
+        allow_fallbacks: bool = True,
+    ) -> GeminiResult:
+        all_candidates = await self._build_candidate_models(model, allow_fallbacks)
+        candidate_models = self._filter_cooldown_models(all_candidates)
+
+        if not candidate_models:
+            raise GeminiQuotaError("No Gemini models are currently available")
+
+        last_error: Exception | None = None
+        for candidate_model in candidate_models:
+            try:
+                response = await self._generate_with_model(
+                    candidate_model=candidate_model,
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    max_output_tokens=max_output_tokens,
+                    temperature=temperature,
+                )
+                text = (response.text or "").strip()
+                if text:
+                    return GeminiResult(text=text, model=candidate_model)
+            except errors.ClientError as exc:
+                if self._is_quota_error(exc):
+                    retry_seconds = self._parse_retry_seconds(exc)
+                    self._cooldown_until[candidate_model] = time.time() + retry_seconds
+                    LOGGER.warning(
+                        "Gemini model %s quota-limited, cooling down for %ss",
+                        candidate_model,
+                        retry_seconds,
+                    )
+                    last_error = exc
+                    continue
+                raise
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        if last_error and self._is_quota_error(last_error):
+            raise GeminiQuotaError("Gemini quota/rate limit exceeded") from last_error
+        if last_error:
+            raise RuntimeError("Gemini generation failed") from last_error
+        raise RuntimeError("Gemini generation returned empty output")
+
+    async def _generate_with_model(
+        self,
+        *,
+        candidate_model: str,
+        prompt: str,
+        system_instruction: str | None,
+        max_output_tokens: int,
+        temperature: float,
+    ):
+        config = self._build_generation_config(
+            model_name=candidate_model,
+            system_instruction=system_instruction,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+            disable_thinking=True,
+        )
+        try:
+            return await self.client.aio.models.generate_content(
+                model=candidate_model,
+                contents=prompt,
+                config=config,
+            )
+        except errors.ClientError as exc:
+            if self._is_thinking_not_supported_error(exc):
+                fallback_config = self._build_generation_config(
+                    model_name=candidate_model,
+                    system_instruction=system_instruction,
+                    max_output_tokens=max_output_tokens,
+                    temperature=temperature,
+                    disable_thinking=False,
+                )
+                return await self.client.aio.models.generate_content(
+                    model=candidate_model,
+                    contents=prompt,
+                    config=fallback_config,
+                )
+            raise
+
+    def _build_generation_config(
+        self,
+        *,
+        model_name: str,
+        system_instruction: str | None,
+        max_output_tokens: int,
+        temperature: float,
+        disable_thinking: bool,
+    ) -> types.GenerateContentConfig:
+        kwargs: dict[str, object] = {
+            "system_instruction": system_instruction,
+            "max_output_tokens": max_output_tokens,
+            "temperature": temperature,
+        }
+        if disable_thinking and self._should_disable_thinking(model_name):
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        return types.GenerateContentConfig(**kwargs)
+
+    async def _build_candidate_models(
+        self, model: str, allow_fallbacks: bool
+    ) -> list[str]:
+        base = self._normalize_model_name(model)
+        if not base or base.lower() == self.AUTO_MODEL:
+            models = await self._resolve_auto_models()
+        else:
+            models = [base]
+
+        if allow_fallbacks:
+            models.extend(self.fallback_models)
+            models.extend(await self._resolve_auto_models())
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in models:
+            if item and item not in seen:
+                deduped.append(item)
+                seen.add(item)
+        return deduped
+
+    async def _resolve_auto_models(self) -> list[str]:
+        available = await self._load_available_models()
+        if not available:
+            return list(self.DEFAULT_AUTO_MODELS)
+
+        resolved: list[str] = []
+        for preferred in self.DEFAULT_AUTO_MODELS:
+            if preferred in available:
+                resolved.append(preferred)
+
+        for name in sorted(available):
+            if (name.startswith("gemini-") or name.startswith("gemma-")) and name not in resolved:
+                resolved.append(name)
+
+        return resolved or list(self.DEFAULT_AUTO_MODELS)
+
+    async def _load_available_models(self) -> set[str]:
+        if self._available_models is not None:
+            return self._available_models
+
+        async with self._list_lock:
+            if self._available_models is not None:
+                return self._available_models
+
+            found: set[str] = set()
+            try:
+                pager = await self.client.aio.models.list()
+                async for item in pager:
+                    name = self._normalize_model_name(getattr(item, "name", ""))
+                    actions = getattr(item, "supported_actions", None) or []
+                    if name and "generateContent" in actions:
+                        found.add(name)
+            except Exception:
+                LOGGER.exception("Failed to list Gemini models")
+
+            self._available_models = found
+            return found
+
+    def _filter_cooldown_models(self, models: list[str]) -> list[str]:
+        if not models:
+            return []
+
+        now = time.time()
+        ready = [m for m in models if self._cooldown_until.get(m, 0) <= now]
+        if ready:
+            return ready
+
+        soonest = min(models, key=lambda m: self._cooldown_until.get(m, 0))
+        return [soonest]
+
+    @staticmethod
+    def _messages_to_prompt(messages: list[dict[str, str]]) -> str:
+        lines: list[str] = []
+        for item in messages:
+            role = item.get("role", "user").upper()
+            content = item.get("content", "").strip()
+            if not content:
+                continue
+            lines.append(f"{role}: {content}")
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _normalize_model_name(name: str) -> str:
+        cleaned = (name or "").strip()
+        if cleaned.startswith("models/"):
+            return cleaned.split("/", 1)[1]
+        return cleaned
+
+    @staticmethod
+    def _parse_retry_seconds(exc: Exception) -> int:
+        text = str(exc)
+
+        match_retry = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", text, flags=re.IGNORECASE)
+        if match_retry:
+            return max(10, int(float(match_retry.group(1))) + 1)
+
+        match_delay = re.search(r"retryDelay['\"]?:\s*['\"]?([0-9]+)s", text, flags=re.IGNORECASE)
+        if match_delay:
+            return max(10, int(match_delay.group(1)) + 1)
+
+        return 30
+
+    @staticmethod
+    def _should_disable_thinking(model_name: str) -> bool:
+        return model_name.startswith("gemini-")
+
+    @staticmethod
+    def _is_thinking_not_supported_error(exc: errors.ClientError) -> bool:
+        text = str(exc).upper()
+        return ("THINKING IS NOT ENABLED" in text) or ("THINKING" in text and "INVALID_ARGUMENT" in text)
+
+    @staticmethod
+    def _is_quota_error(exc: Exception) -> bool:
+        if isinstance(exc, errors.ClientError):
+            code = getattr(exc, "code", None)
+            status = str(getattr(exc, "status", "")).upper()
+            if code == 429:
+                return True
+            if "RESOURCE_EXHAUSTED" in status:
+                return True
+
+        text = str(exc).upper()
+        return ("429" in text) or ("RESOURCE_EXHAUSTED" in text) or ("QUOTA" in text)
