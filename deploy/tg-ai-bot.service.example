@@ -1,0 +1,22 @@
+[Unit]
+Description=Self-hosted Telegram AI bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telegrambot
+Group=telegrambot
+WorkingDirectory=/opt/tg-ai-bot
+EnvironmentFile=/opt/tg-ai-bot/.env
+Environment=SQLITE_PATH=/var/lib/tg-ai-bot/bot_memory.sqlite3
+ExecStart=/opt/tg-ai-bot/.venv/bin/python /opt/tg-ai-bot/main.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tg-ai-bot
+
+[Install]
+WantedBy=multi-user.target

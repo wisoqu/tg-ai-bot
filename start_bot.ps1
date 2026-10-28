@@ -1,28 +1,16 @@
 $ErrorActionPreference = "Stop"
-
 $root = $PSScriptRoot
-$envFile = Join-Path $root ".env"
-$pythonExe = Join-Path $root "venv\\Scripts\\python.exe"
-$mainFile = Join-Path $root "main.py"
-
-if (-not (Test-Path $envFile)) {
-    Copy-Item (Join-Path $root ".env.example") $envFile
-    throw ".env was missing and has been created from .env.example. Fill required keys and rerun."
+Set-Location $root
+$python = Get-Command python -ErrorAction SilentlyContinue
+if (-not $python) { throw "Install Python 3.10+ first: https://www.python.org/downloads/" }
+$venvPython = Join-Path $root ".venv\Scripts\python.exe"
+if (-not (Test-Path $venvPython)) {
+    python -m venv .venv
+    & $venvPython -m pip install --upgrade pip
+    & $venvPython -m pip install -r requirements.txt
 }
-
-$envText = Get-Content $envFile -Raw
-
-$tokenMatch = [regex]::Match($envText, "(?m)^TELEGRAM_BOT_TOKEN=(.*)$")
-$token = $tokenMatch.Groups[1].Value.Trim()
-if (-not $token -or $token -eq "your_telegram_token_here") {
-    throw "Set TELEGRAM_BOT_TOKEN in .env before launch."
+if (-not (Test-Path (Join-Path $root ".env"))) {
+    & $venvPython manage.py setup
 }
-
-$geminiMatch = [regex]::Match($envText, "(?m)^GEMINI_API_KEY=(.*)$")
-$geminiKey = $geminiMatch.Groups[1].Value.Trim()
-if (-not $geminiKey -or $geminiKey -eq "your_gemini_api_key_here") {
-    throw "Set GEMINI_API_KEY in .env before launch."
-}
-
-& $pythonExe $mainFile
-
+& $venvPython manage.py check
+& $venvPython main.py
