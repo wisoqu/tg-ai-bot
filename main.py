@@ -13,6 +13,7 @@ from telegram import (
     Message,
     MessageEntity,
     Update,
+    LabeledPrice,
 )
 from telegram.constants import ChatAction, ChatMemberStatus, ParseMode
 from telegram.ext import (
@@ -21,6 +22,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -369,6 +371,7 @@ class TelegramGeminiBot:
         self.store = MemoryStore(cfg.sqlite_path)
         self.llm = GeminiService(
             api_key=cfg.gemini_api_key,
+            api_keys=cfg.gemini_api_keys,
             fallback_models=cfg.gemini_fallback_models,
         )
         self.chat_locks: dict[int, asyncio.Lock] = {}
@@ -380,10 +383,11 @@ class TelegramGeminiBot:
             f"Group trigger: {self.cfg.trigger_mention}\n"
             f"In groups I respond if you mention {username_hint}, use "
             f"{self.cfg.trigger_mention}, or reply to my message.\n"
-            f"Private limit: {self.cfg.private_chat_limit_messages} messages / "
-            f"{self.cfg.private_chat_limit_window_hours}h per user.\n"
-            "Group chats have no per-user limit.\n"
-            "Commands: /start, /status, /reset"
+            f"Daily token limits: {self.cfg.private_daily_token_limit:,} tokens per private user; "
+            f"{self.cfg.group_daily_token_limit:,} tokens per group.\n"
+            "Use /usage to see your remaining quota. Group context keeps about 20 recent messages.\n"
+            "Save facts with /remember text; clear saved facts with /forget.\n"
+            "Commands: /start, /status, /usage, /buy (private), /remember, /forget, /reset"
         )
 
     @staticmethod
@@ -407,10 +411,17 @@ class TelegramGeminiBot:
             BotCommand("start", "Show how to call bot"),
             BotCommand("status", "Show memory and model status"),
             BotCommand("reset", "Clear chat memory"),
+            BotCommand("usage", "Show remaining daily tokens"),
+            BotCommand("remember", "Save a fact to memory"),
+            BotCommand("forget", "Clear saved facts (group admins)"),
         ]
         private_commands = [
             BotCommand("start", "Show usage"),
             BotCommand("status", "Show memory and model status"),
+            BotCommand("usage", "Show remaining daily tokens"),
+            BotCommand("buy", "Buy token package with Stars"),
+            BotCommand("remember", "Save a fact to memory"),
+            BotCommand("forget", "Clear saved facts"),
             BotCommand("reset", "Clear chat memory"),
         ]
 
@@ -435,6 +446,9 @@ class TelegramGeminiBot:
         message = update.effective_message
         if not message:
             return
+        chat = update.effective_chat
+        if chat:
+            self.store.remember_chat(chat.id, chat.type, chat.title or "")
         bot_username = context.bot_data.get("bot_username", "")
         await message.reply_text(self._build_usage_text(bot_username))
 
@@ -448,29 +462,112 @@ class TelegramGeminiBot:
         msg_count = self.store.message_count(chat_id)
         has_summary = "yes" if self.store.get_summary(chat_id) else "no"
         text = (
-            f"messages={msg_count}, summary={has_summary}, "
-            f"model={self.cfg.gemini_model}, summary_model={self.cfg.gemini_summary_model}, "
-            f"context_tokens={self.cfg.max_context_tokens}, "
+            f"messages={msg_count}, saved_facts={len(self.store.fetch_memories(chat_id))}, "
+            f"model={self.cfg.gemini_model}, context_tokens={self.cfg.max_context_tokens}, "
             f"recent={self.cfg.recent_messages}, group_recent={self.cfg.group_recent_messages}, "
-            f"private_limit={self.cfg.private_chat_limit_messages}/{self.cfg.private_chat_limit_window_hours}h"
+            f"retention={self.cfg.memory_retention_days} days"
         )
-        if not is_group_chat(chat.type) and update.effective_user:
-            window_seconds = self.cfg.private_chat_limit_window_hours * 3600
-            since_epoch = int(time.time()) - window_seconds
-            used = self.store.count_private_requests_since(
-                update.effective_user.id, since_epoch
-            )
-            text += f", used={used}"
         await message.reply_text(text)
+
+    async def cmd_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+        if not msg or not chat or not user: return
+        if is_group_chat(chat.type):
+            await msg.reply_text("Покупать токены можно только в личном чате с ботом. Групповую квоту пополнить нельзя.")
+            return
+        if not self.cfg.star_token_packs:
+            await msg.reply_text("Покупка через Stars пока не настроена. Администратор должен задать STAR_TOKEN_PACKS в .env.")
+            return
+        for tokens, stars in self.cfg.star_token_packs:
+            payload = f"tokens:{user.id}:{tokens}:{__import__('secrets').token_urlsafe(12)}"
+            self.store.create_purchase(payload, user.id, tokens, stars)
+            await context.bot.send_invoice(chat_id=chat.id, title=f"Пакет {tokens:,} токенов", description="Токены для запросов к боту. Начисление после подтверждения Telegram Stars.", payload=payload, provider_token="", currency="XTR", prices=[LabeledPrice(f"{tokens:,} токенов", stars)])
+
+    async def on_precheckout(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.pre_checkout_query
+        if not query: return
+        item = self.store.purchase(query.invoice_payload)
+        ok = bool(item and item["status"] == "pending" and item["user_id"] == query.from_user.id and item["stars"] == query.total_amount and query.currency == "XTR")
+        await query.answer(ok=ok, error_message=None if ok else "Счёт недействителен или уже обработан. Запросите новый через /buy.")
+
+    async def on_successful_payment(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        payment = msg.successful_payment if msg else None
+        user = update.effective_user
+        if not payment or not user: return
+        credited = self.store.settle_purchase(payment.invoice_payload, user.id, payment.total_amount, payment.telegram_payment_charge_id)
+        if credited:
+            await msg.reply_text(f"Оплата получена! Начислено {self.store.purchase(payment.invoice_payload)['tokens']:,} токенов. Баланс: {self.store.token_balance(user.id):,}.")
+        else:
+            LOGGER.error("Could not settle Stars payment payload=%s", payment.invoice_payload)
+            await msg.reply_text("Не удалось автоматически зачислить платёж. Напишите администратору и укажите идентификатор платежа.")
+
+    async def cmd_usage(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.effective_message
+        if not chat or not user or not message: return
+        group = is_group_chat(chat.type)
+        scope, scope_id = ("group", chat.id) if group else ("user", user.id)
+        limit = self.cfg.group_daily_token_limit if group else self.cfg.private_daily_token_limit
+        used = self.store.usage_since(scope, scope_id, self._day_start_utc())
+        remaining = max(0, limit-used)
+        used_free = min(limit, used)
+        paid_balance = 0 if group else self.store.token_balance(user.id)
+        avg_exchange = 1200
+        estimated_exchanges = remaining // avg_exchange
+        estimated_words = int(remaining * 0.75)
+        await message.reply_text(
+            f"Использовано из дневной квоты: {used_free:,} из {limit:,} токенов. Осталось: {remaining:,}.\n"
+            f"Это примерно {estimated_words:,} слов или около {estimated_exchanges} типичных обращений "
+            "(запрос + ответ; фактический расход зависит от длины контекста).\n"
+            + (f"Платный баланс: {paid_balance:,} токенов.\nПокупка пакетов: /buy" if not group else "")
+        )
+
+    @staticmethod
+    def _day_start_utc() -> int:
+        now = int(time.time())
+        return now - (now % 86400)
+
+    async def cmd_remember(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+        fact = " ".join(context.args or []).strip()
+        if not msg or not chat or not user: return
+        if not fact:
+            await msg.reply_text("Использование: /remember текст для сохранения")
+            return
+        if is_group_chat(chat.type):
+            member = await context.bot.get_chat_member(chat.id, user.id)
+            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                await msg.reply_text("В группе добавлять факты в общую память могут только администраторы.")
+                return
+        self.store.remember(chat.id, user.id, fact, self.cfg.memory_retention_days)
+        await msg.reply_text(f"Сохранил в памяти на {self.cfg.memory_retention_days} дней.")
+
+    async def cmd_forget(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+        if not msg or not chat or not user: return
+        if is_group_chat(chat.type):
+            member = await context.bot.get_chat_member(chat.id, user.id)
+            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                await msg.reply_text("Очистить память группы может только администратор.")
+                return
+        self.store.clear_memories(chat.id)
+        await msg.reply_text("Явная память этого чата очищена.")
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
         message = update.effective_message
         if not chat or not message:
             return
+        if is_group_chat(chat.type) and update.effective_user:
+            member = await context.bot.get_chat_member(chat.id, update.effective_user.id)
+            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                await message.reply_text("Очистить историю и память группы может только администратор.")
+                return
 
         self.store.clear_chat(chat.id)
-        await message.reply_text("Memory was cleared for this chat.")
+        await message.reply_text("Память и история этого чата очищены.")
 
     async def on_my_chat_member(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -493,6 +590,15 @@ class TelegramGeminiBot:
         if not message or not message.text:
             return
 
+        self.store.prune_expired(self.cfg.memory_retention_days)
+        if self.store.get_setting("enabled", "1") != "1":
+            return
+        self.store.remember_chat(message.chat.id, message.chat.type, message.chat.title or "")
+        if is_group_chat(message.chat.type):
+            self.store.remember_chat(message.chat.id, message.chat.type, message.chat.title or "")
+            if not (message.from_user and message.from_user.id == context.bot_data.get("bot_id")):
+                self.store.add_message(message.chat.id, "user", format_user_text(message, message.text), author_id=message.from_user.id if message.from_user else None)
+
         bot_username = context.bot_data.get("bot_username", "")
         bot_id = context.bot_data.get("bot_id")
         if not should_respond(message, bot_username, self.cfg.trigger_mention, bot_id):
@@ -507,19 +613,8 @@ class TelegramGeminiBot:
         lock = self.chat_locks.setdefault(chat_id, asyncio.Lock())
 
         async with lock:
-            if not chat_is_group:
-                current_user = message.from_user
-                if current_user is None:
-                    return
-                allowed, wait_seconds = self._check_private_rate_limit(
-                    current_user.id, chat_id
-                )
-                if not allowed:
-                    await message.reply_text(
-                        "Private chat limit reached. "
-                        f"Try again in {format_wait_time(wait_seconds)}."
-                    )
-                    return
+            if not chat_is_group and message.from_user is None:
+                return
 
             user_text = format_user_text(message, clean_text)
             current_user_id = message.from_user.id if message.from_user else None
@@ -533,6 +628,10 @@ class TelegramGeminiBot:
                 bot_id=bot_id if isinstance(bot_id, int) else None,
             )
             summary = self.store.get_summary(chat_id)
+            memories = self.store.fetch_memories(chat_id)
+            if memories:
+                memory_lines = "\n".join(f"- {m['fact']} (сохранено {m['created_at'][:10]})" for m in memories)
+                summary = (summary + "\n\nВажная сохраненная память:\n" + memory_lines).strip()
             model_messages = build_generation_messages(
                 self.cfg,
                 summary,
@@ -540,6 +639,16 @@ class TelegramGeminiBot:
                 user_text,
                 relevant_records=relevant_records,
             )
+
+            scope, scope_id = ("group", chat_id) if chat_is_group else ("user", current_user_id or 0)
+            daily_limit = self.cfg.group_daily_token_limit if chat_is_group else self.cfg.private_daily_token_limit
+            used_today = self.store.usage_since(scope, scope_id, self._day_start_utc())
+            reservation = sum(approx_tokens(m["content"]) for m in model_messages) + approx_tokens(self.cfg.system_prompt) + self.cfg.max_reply_tokens
+            remaining_free = max(0, daily_limit - used_today)
+            paid_balance = 0 if chat_is_group else self.store.token_balance(current_user_id or 0)
+            if max(0, reservation - remaining_free) > paid_balance:
+                await message.reply_text("Дневная бесплатная квота и оплаченный баланс исчерпаны. Остаток смотрите в /usage; купить пакет можно в личке командой /buy.")
+                return
 
             try:
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -564,15 +673,19 @@ class TelegramGeminiBot:
                 return
 
             answer = (result.text or "").strip()
+            billed_tokens = result.input_tokens + result.output_tokens
+            if billed_tokens <= 0:
+                billed_tokens = sum(approx_tokens(m["content"]) for m in model_messages) + approx_tokens(answer)
+            remaining_free = max(0, daily_limit - used_today)
+            paid_due = max(0, billed_tokens - remaining_free)
+            if paid_due and current_user_id is not None:
+                self.store.spend_balance(current_user_id, paid_due)
+            self.store.add_usage(scope, scope_id, billed_tokens)
             if not answer:
                 answer = "I could not generate a response. Please try again."
 
-            self.store.add_message(
-                chat_id,
-                "user",
-                user_text,
-                author_id=current_user_id,
-            )
+            if not chat_is_group:
+                self.store.add_message(chat_id, "user", user_text, author_id=current_user_id)
             self.store.add_message(
                 chat_id,
                 "assistant",
@@ -581,10 +694,69 @@ class TelegramGeminiBot:
             )
             await self._send_reply(message, context, answer)
 
-            try:
-                await self.maybe_compact_history(chat_id)
-            except Exception:
-                LOGGER.exception("History compaction failed")
+    async def on_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg or not msg.voice: return
+        self.store.prune_expired(self.cfg.memory_retention_days)
+        self.store.remember_chat(msg.chat.id, msg.chat.type, msg.chat.title or "")
+        if self.store.get_setting("enabled", "1") != "1": return
+        group = is_group_chat(msg.chat.type)
+        bot_id = context.bot_data.get("bot_id")
+        username = context.bot_data.get("bot_username", "")
+        caption_mentions = bool(username and re.search(rf"@{re.escape(username)}\b", msg.caption or "", re.IGNORECASE))
+        addressed = (not group) or bool(msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == bot_id) or caption_mentions or contains_trigger_mention(msg.caption or "", self.cfg.trigger_mention)
+        if not addressed: return
+        if msg.voice.duration > self.cfg.max_voice_seconds:
+            await msg.reply_text(f"Голосовое слишком длинное (лимит {self.cfg.max_voice_seconds} сек.).")
+            return
+        user = update.effective_user
+        scope, sid = ("group", msg.chat.id) if group else ("user", user.id if user else 0)
+        limit = self.cfg.group_daily_token_limit if group else self.cfg.private_daily_token_limit
+        used_before_audio = self.store.usage_since(scope, sid, self._day_start_utc())
+        current_balance = 0 if group or user is None else self.store.token_balance(user.id)
+        if used_before_audio + msg.voice.duration * 32 >= limit + current_balance:
+            await msg.reply_text("Дневная квота и оплаченный баланс исчерпаны. Проверьте /usage.")
+            return
+        try:
+            tgfile = await context.bot.get_file(msg.voice.file_id)
+            audio = bytes(await tgfile.download_as_bytearray())
+            tr = await self.llm.transcribe_audio(audio, msg.voice.mime_type or "audio/ogg")
+            transcript = tr.text.strip()
+            if not transcript:
+                await msg.reply_text("Не удалось распознать речь.")
+                return
+            user = update.effective_user
+            scope, sid = ("group", msg.chat.id) if group else ("user", user.id if user else 0)
+            limit = self.cfg.group_daily_token_limit if group else self.cfg.private_daily_token_limit
+            used = self.store.usage_since(scope, sid, self._day_start_utc())
+            context_rows = self.store.fetch_recent_records(msg.chat.id, 20)
+            hist = [{"role": x["role"], "content": x["content"]} for x in context_rows]
+            text = f"{user.full_name if group and user else ''}: {transcript}" if group else transcript
+            memories = self.store.fetch_memories(msg.chat.id)
+            summary = "Важная сохраненная память:\n" + "\n".join(f"- {m['fact']}" for m in memories) if memories else ""
+            msgs = build_generation_messages(self.cfg, summary, hist, text, self.store.fetch_relevant_records(chat_id=msg.chat.id, query=transcript, limit=self.cfg.retrieval_max_messages, lookback_messages=self.cfg.retrieval_lookback_messages))
+            reservation = tr.input_tokens + tr.output_tokens + sum(approx_tokens(m["content"]) for m in msgs) + self.cfg.max_reply_tokens
+            remaining_free = max(0, limit - used)
+            balance = 0 if group or user is None else self.store.token_balance(user.id)
+            if max(0, reservation - remaining_free) > balance:
+                self.store.add_usage(scope, sid, tr.input_tokens + tr.output_tokens)
+                await msg.reply_text("Дневная квота и оплаченный баланс исчерпаны. Проверьте /usage.")
+                return
+            result = await self.llm.generate_from_messages(model=self.cfg.gemini_model, messages=msgs, system_instruction=self.cfg.system_prompt, max_output_tokens=self.cfg.max_reply_tokens, temperature=self.cfg.temperature)
+            used_tokens = tr.input_tokens + tr.output_tokens + result.input_tokens + result.output_tokens
+            if used_tokens <= 0: used_tokens = approx_tokens(transcript) + approx_tokens(result.text)
+            remaining_free = max(0, limit - used)
+            paid_due = max(0, used_tokens - remaining_free)
+            if paid_due and user is not None and not group:
+                self.store.spend_balance(user.id, paid_due)
+            self.store.add_usage(scope, sid, used_tokens)
+            author = user.id if user else None
+            self.store.add_message(msg.chat.id, "user", text, author_id=author)
+            self.store.add_message(msg.chat.id, "assistant", result.text, author_id=bot_id)
+            await self._send_reply(msg, context, result.text)
+        except Exception:
+            LOGGER.exception("Voice processing failed")
+            await msg.reply_text("Не получилось обработать голосовое сообщение. Попробуйте позже.")
 
     async def _send_reply(
         self,
@@ -724,7 +896,14 @@ def build_application(cfg: AppConfig) -> Application:
     app.add_handler(ChatMemberHandler(bot.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("start", bot.cmd_start))
     app.add_handler(CommandHandler("status", bot.cmd_status))
+    app.add_handler(CommandHandler("usage", bot.cmd_usage))
+    app.add_handler(CommandHandler("buy", bot.cmd_buy))
+    app.add_handler(PreCheckoutQueryHandler(bot.on_precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, bot.on_successful_payment))
+    app.add_handler(CommandHandler("remember", bot.cmd_remember))
+    app.add_handler(CommandHandler("forget", bot.cmd_forget))
     app.add_handler(CommandHandler("reset", bot.cmd_reset))
+    app.add_handler(MessageHandler(filters.VOICE, bot.on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_text))
     app.add_error_handler(bot.on_error)
     return app
@@ -737,7 +916,16 @@ def main() -> None:
     )
     cfg = AppConfig.from_env()
     app = build_application(cfg)
-    app.run_polling(drop_pending_updates=True)
+    pid_path = cfg.sqlite_path + ".pid"
+    with open(pid_path, "w", encoding="utf-8") as pid_file:
+        pid_file.write(str(__import__("os").getpid()))
+    try:
+        app.run_polling(drop_pending_updates=True)
+    finally:
+        try:
+            __import__("os").remove(pid_path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
