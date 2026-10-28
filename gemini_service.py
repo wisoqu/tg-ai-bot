@@ -15,6 +15,8 @@ LOGGER = logging.getLogger(__name__)
 class GeminiResult:
     text: str
     model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class GeminiQuotaError(RuntimeError):
@@ -33,8 +35,10 @@ class GeminiService:
         "gemma-3-4b-it",
     ]
 
-    def __init__(self, api_key: str, fallback_models: list[str] | None = None) -> None:
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, api_key: str, fallback_models: list[str] | None = None, api_keys: list[str] | None = None) -> None:
+        self.api_keys = list(dict.fromkeys(api_keys or [api_key]))
+        self._key_index = 0
+        self.client = genai.Client(api_key=self.api_keys[0])
         self.fallback_models = [
             self._normalize_model_name(item)
             for item in (fallback_models or [])
@@ -64,6 +68,30 @@ class GeminiService:
             allow_fallbacks=allow_fallbacks,
         )
 
+    async def transcribe_audio(self, audio: bytes, mime_type: str, model: str = "gemini-2.5-flash-lite") -> GeminiResult:
+        part = types.Part.from_bytes(data=audio, mime_type=mime_type)
+        last_error: Exception | None = None
+        response = None
+        for attempt in range(max(1, len(self.api_keys))):
+            try:
+                response = await self.client.aio.models.generate_content(
+                    model=model, contents=[part, "Transcribe the spoken words verbatim. Return only the transcription; preserve the original language."]
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < len(self.api_keys):
+                    self._rotate_key()
+                else:
+                    raise
+        if response is None:
+            raise RuntimeError("Gemini transcription failed") from last_error
+        text = (response.text or "").strip()
+        usage = getattr(response, "usage_metadata", None)
+        return GeminiResult(text=text, model=model,
+            input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
+            output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0))
+
     async def generate_text(
         self,
         *,
@@ -92,7 +120,10 @@ class GeminiService:
                 )
                 text = (response.text or "").strip()
                 if text:
-                    return GeminiResult(text=text, model=candidate_model)
+                    usage = getattr(response, "usage_metadata", None)
+                    return GeminiResult(text=text, model=candidate_model,
+                        input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
+                        output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0) + int(getattr(usage, "thoughts_token_count", 0) or 0))
             except errors.ClientError as exc:
                 if self._is_quota_error(exc):
                     retry_seconds = self._parse_retry_seconds(exc)
@@ -103,10 +134,17 @@ class GeminiService:
                         retry_seconds,
                     )
                     last_error = exc
+                    self._rotate_key()
                     continue
+                if self._is_key_error(exc):
+                    last_error = exc
+                    if self._rotate_key():
+                        continue
                 raise
             except Exception as exc:
                 last_error = exc
+                if self._is_key_error(exc):
+                    self._rotate_key()
                 continue
 
         if last_error and self._is_quota_error(last_error):
@@ -252,6 +290,19 @@ class GeminiService:
                 continue
             lines.append(f"{role}: {content}")
         return "\n\n".join(lines)
+
+    def _rotate_key(self) -> bool:
+        if len(self.api_keys) < 2:
+            return False
+        self._key_index = (self._key_index + 1) % len(self.api_keys)
+        self.client = genai.Client(api_key=self.api_keys[self._key_index])
+        LOGGER.warning("Switched Gemini API key index %s; keys from one project share quota", self._key_index + 1)
+        return True
+
+    @staticmethod
+    def _is_key_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(term in text for term in ("api key not valid", "invalid api key", "permission_denied", "unauthenticated"))
 
     @staticmethod
     def _normalize_model_name(name: str) -> str:

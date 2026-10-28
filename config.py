@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -34,7 +35,7 @@ def _env_models(name: str) -> list[str]:
     raw = _env_str(name, "")
     if not raw:
         return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
+    return [item.strip() for item in re.split(r"[\s,]+", raw) if item.strip()]
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,12 @@ class AppConfig:
     temperature: float
     private_chat_limit_messages: int
     private_chat_limit_window_hours: int
+    gemini_api_keys: list[str]
+    private_daily_token_limit: int
+    group_daily_token_limit: int
+    memory_retention_days: int
+    max_voice_seconds: int
+    star_token_packs: list[tuple[int, int]]
 
     @staticmethod
     def from_env() -> "AppConfig":
@@ -69,10 +76,13 @@ class AppConfig:
 
         telegram_bot_token = _env_str("TELEGRAM_BOT_TOKEN")
         gemini_api_key = _env_str("GEMINI_API_KEY")
+        configured_keys = _env_models("GEMINI_API_KEYS")
+        if not gemini_api_key and configured_keys:
+            gemini_api_key = configured_keys[0]
         if not telegram_bot_token:
             raise ValueError("TELEGRAM_BOT_TOKEN is required")
         if not gemini_api_key:
-            raise ValueError("GEMINI_API_KEY is required")
+            raise ValueError("Set GEMINI_API_KEY or GEMINI_API_KEYS")
 
         primary_model = _env_str("GEMINI_MODEL", "auto")
 
@@ -88,7 +98,7 @@ class AppConfig:
             max_context_tokens=_env_int("MAX_CONTEXT_TOKENS", 2800),
             max_reply_tokens=_env_int("MAX_REPLY_TOKENS", 900),
             recent_messages=_env_int("RECENT_MESSAGES", 20),
-            group_recent_messages=_env_int("GROUP_RECENT_MESSAGES", 28),
+            group_recent_messages=_env_int("GROUP_RECENT_MESSAGES", 20),
             group_focus_messages=_env_int("GROUP_FOCUS_MESSAGES", 18),
             retrieval_max_messages=_env_int("RETRIEVAL_MAX_MESSAGES", 10),
             retrieval_lookback_messages=_env_int("RETRIEVAL_LOOKBACK_MESSAGES", 320),
@@ -100,4 +110,10 @@ class AppConfig:
             temperature=_env_float("TEMPERATURE", 0.4),
             private_chat_limit_messages=_env_int("PRIVATE_CHAT_LIMIT_MESSAGES", 20),
             private_chat_limit_window_hours=_env_int("PRIVATE_CHAT_LIMIT_WINDOW_HOURS", 5),
+            gemini_api_keys=_env_models("GEMINI_API_KEYS") or ([gemini_api_key] if gemini_api_key else []),
+            private_daily_token_limit=_env_int("PRIVATE_DAILY_TOKEN_LIMIT", 40000),
+            group_daily_token_limit=_env_int("GROUP_DAILY_TOKEN_LIMIT", 150000),
+            memory_retention_days=_env_int("MEMORY_RETENTION_DAYS", 30),
+            max_voice_seconds=_env_int("MAX_VOICE_SECONDS", 120),
+            star_token_packs=[tuple(map(int, item.split(":"))) for item in _env_str("STAR_TOKEN_PACKS", "").split(",") if item.strip()],
         )

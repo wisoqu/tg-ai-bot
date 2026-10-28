@@ -115,6 +115,26 @@ class MemoryStore:
                 ON private_requests(user_id, created_at)
                 """
             )
+            conn.execute("""CREATE TABLE IF NOT EXISTS usage_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL,
+                scope_id INTEGER NOT NULL, tokens INTEGER NOT NULL,
+                created_at INTEGER NOT NULL)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_scope_time ON usage_ledger(scope, scope_id, created_at)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS saved_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL, fact TEXT NOT NULL,
+                created_at TEXT NOT NULL, expires_at INTEGER NOT NULL)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_saved_memories_chat_exp ON saved_memories(chat_id, expires_at)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS known_chats (
+                chat_id INTEGER PRIMARY KEY, chat_type TEXT NOT NULL, title TEXT NOT NULL DEFAULT '')""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS token_balances (
+                user_id INTEGER PRIMARY KEY, tokens INTEGER NOT NULL DEFAULT 0)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS star_purchases (
+                payload TEXT PRIMARY KEY, user_id INTEGER NOT NULL, tokens INTEGER NOT NULL,
+                stars INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                telegram_charge_id TEXT UNIQUE, created_at INTEGER NOT NULL)""")
             conn.commit()
 
     def add_message(
@@ -319,10 +339,104 @@ class MemoryStore:
             )
             conn.commit()
 
+    def create_purchase(self, payload: str, user_id: int, tokens: int, stars: int) -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT INTO star_purchases(payload,user_id,tokens,stars,created_at) VALUES(?,?,?,?,?)",(payload,user_id,tokens,stars,int(time.time())))
+
+    def purchase(self, payload: str) -> dict[str, Any] | None:
+        with self._connect() as conn: row=conn.execute("SELECT * FROM star_purchases WHERE payload=?",(payload,)).fetchone()
+        return dict(row) if row else None
+
+    def settle_purchase(self, payload: str, user_id: int, stars: int, charge_id: str) -> bool:
+        with self._connect() as conn:
+            row=conn.execute("SELECT * FROM star_purchases WHERE payload=?",(payload,)).fetchone()
+            if not row or row["status"] != "pending" or row["user_id"] != user_id or row["stars"] != stars: return False
+            conn.execute("UPDATE star_purchases SET status='paid',telegram_charge_id=? WHERE payload=?",(charge_id,payload))
+            conn.execute("INSERT INTO token_balances(user_id,tokens) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET tokens=tokens+excluded.tokens",(user_id,row["tokens"]))
+            return True
+
+    def token_balance(self, user_id: int) -> int:
+        with self._connect() as conn: row=conn.execute("SELECT tokens FROM token_balances WHERE user_id=?",(user_id,)).fetchone()
+        return int(row["tokens"]) if row else 0
+
+    def spend_balance(self, user_id: int, tokens: int) -> bool:
+        with self._connect() as conn:
+            row=conn.execute("SELECT tokens FROM token_balances WHERE user_id=?",(user_id,)).fetchone()
+            balance=int(row["tokens"]) if row else 0
+            if balance < tokens: return False
+            conn.execute("UPDATE token_balances SET tokens=tokens-? WHERE user_id=?",(tokens,user_id))
+            return True
+
+    def add_usage(self, scope: str, scope_id: int, tokens: int, created_at: int | None = None) -> None:
+        if tokens <= 0: return
+        with self._connect() as conn:
+            conn.execute("INSERT INTO usage_ledger(scope,scope_id,tokens,created_at) VALUES(?,?,?,?)",
+                         (scope, scope_id, tokens, created_at or int(time.time())))
+
+    def usage_since(self, scope: str, scope_id: int, since: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COALESCE(SUM(tokens),0) n FROM usage_ledger WHERE scope=? AND scope_id=? AND created_at>=?", (scope,scope_id,since)).fetchone()
+        return int(row["n"])
+
+    def remember(self, chat_id: int, user_id: int, fact: str, retention_days: int = 30) -> None:
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute("INSERT INTO saved_memories(chat_id,user_id,fact,created_at,expires_at) VALUES(?,?,?,?,?)",
+                         (chat_id,user_id,fact,datetime.now(timezone.utc).isoformat(),now+retention_days*86400))
+
+    def fetch_memories(self, chat_id: int) -> list[dict[str, Any]]:
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute("DELETE FROM saved_memories WHERE expires_at<=?", (now,))
+            rows = conn.execute("SELECT id,user_id,fact,created_at FROM saved_memories WHERE chat_id=? AND expires_at>? ORDER BY id DESC",(chat_id,now)).fetchall()
+        return [dict(row) for row in rows]
+
+    def clear_memories(self, chat_id: int) -> None:
+        with self._connect() as conn: conn.execute("DELETE FROM saved_memories WHERE chat_id=?",(chat_id,))
+
+    def remember_chat(self, chat_id: int, chat_type: str, title: str) -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT INTO known_chats(chat_id,chat_type,title) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type,title=excluded.title",(chat_id,chat_type,title))
+
+    def known_chat_ids(self) -> list[int]:
+        with self._connect() as conn: rows=conn.execute("SELECT chat_id FROM known_chats").fetchall()
+        return [int(r["chat_id"]) for r in rows]
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        with self._connect() as conn: row=conn.execute("SELECT value FROM bot_settings WHERE key=?",(key,)).fetchone()
+        return str(row["value"]) if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._connect() as conn: conn.execute("INSERT INTO bot_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
+
+    def prune_expired(self, retention_days: int = 30) -> None:
+        cutoff = datetime.now(timezone.utc).timestamp() - retention_days*86400
+        with self._connect() as conn:
+            conn.execute("DELETE FROM messages WHERE created_at < ?", (datetime.fromtimestamp(cutoff, timezone.utc).isoformat(),))
+            # Legacy rolling summaries had no reliable source-date range; remove them to honor TTL.
+            conn.execute("DELETE FROM chat_state")
+            conn.execute("DELETE FROM usage_ledger WHERE created_at < ?", (int(time.time())-90*86400,))
+            conn.execute("DELETE FROM saved_memories WHERE expires_at<=?",(int(time.time()),))
+
+    def clear_all_memory(self) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM messages")
+            conn.execute("DELETE FROM chat_state")
+            conn.execute("DELETE FROM saved_memories")
+            conn.commit()
+
+    def vacuum(self) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+
     def clear_chat(self, chat_id: int) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
             conn.execute("DELETE FROM chat_state WHERE chat_id = ?", (chat_id,))
+            conn.execute("DELETE FROM saved_memories WHERE chat_id = ?", (chat_id,))
             conn.execute("DELETE FROM private_requests WHERE chat_id = ?", (chat_id,))
             conn.commit()
 
