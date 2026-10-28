@@ -1,4 +1,5 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -18,3 +19,7 @@ data/
 
 # Local notes/audits
 CODE_AUDIT_*.md
+
+# Deployment artifacts
+.env.docker
+.DS_Store

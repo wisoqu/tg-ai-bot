@@ -45,6 +45,9 @@ def _tokenize_query(text: str) -> list[str]:
 class MemoryStore:
     def __init__(self, path: str) -> None:
         self.path = path
+        if path != ":memory:":
+            from pathlib import Path
+            Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -119,6 +122,10 @@ class MemoryStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL,
                 scope_id INTEGER NOT NULL, tokens INTEGER NOT NULL,
                 created_at INTEGER NOT NULL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS usage_reservations (
+                reservation_id TEXT PRIMARY KEY, scope TEXT NOT NULL, scope_id INTEGER NOT NULL,
+                reserved_tokens INTEGER NOT NULL, paid_reserved INTEGER NOT NULL,
+                user_id INTEGER, created_at INTEGER NOT NULL)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_scope_time ON usage_ledger(scope, scope_id, created_at)")
             conn.execute("""CREATE TABLE IF NOT EXISTS saved_memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
@@ -348,12 +355,22 @@ class MemoryStore:
         return dict(row) if row else None
 
     def settle_purchase(self, payload: str, user_id: int, stars: int, charge_id: str) -> bool:
-        with self._connect() as conn:
-            row=conn.execute("SELECT * FROM star_purchases WHERE payload=?",(payload,)).fetchone()
-            if not row or row["status"] != "pending" or row["user_id"] != user_id or row["stars"] != stars: return False
-            conn.execute("UPDATE star_purchases SET status='paid',telegram_charge_id=? WHERE payload=?",(charge_id,payload))
-            conn.execute("INSERT INTO token_balances(user_id,tokens) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET tokens=tokens+excluded.tokens",(user_id,row["tokens"]))
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM star_purchases WHERE payload=?", (payload,)).fetchone()
+            if not row or row["status"] != "pending" or row["user_id"] != user_id or row["stars"] != stars:
+                conn.rollback()
+                return False
+            conn.execute("UPDATE star_purchases SET status='paid',telegram_charge_id=? WHERE payload=?", (charge_id, payload))
+            conn.execute("INSERT INTO token_balances(user_id,tokens) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET tokens=tokens+excluded.tokens", (user_id, row["tokens"]))
+            conn.commit()
             return True
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
 
     def token_balance(self, user_id: int) -> int:
         with self._connect() as conn: row=conn.execute("SELECT tokens FROM token_balances WHERE user_id=?",(user_id,)).fetchone()
@@ -370,8 +387,133 @@ class MemoryStore:
     def add_usage(self, scope: str, scope_id: int, tokens: int, created_at: int | None = None) -> None:
         if tokens <= 0: return
         with self._connect() as conn:
+            timestamp = created_at or int(time.time())
             conn.execute("INSERT INTO usage_ledger(scope,scope_id,tokens,created_at) VALUES(?,?,?,?)",
-                         (scope, scope_id, tokens, created_at or int(time.time())))
+                         (scope, scope_id, tokens, timestamp))
+            if scope != "global":
+                conn.execute("INSERT INTO usage_ledger(scope,scope_id,tokens,created_at) VALUES('global',0,?,?)",
+                             (tokens, timestamp))
+
+    def reserve_usage(
+        self, reservation_id: str, scope: str, scope_id: int, tokens: int,
+        daily_limit: int, global_limit: int, *, since: int, user_id: int | None = None,
+    ) -> tuple[bool, str]:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM usage_reservations WHERE created_at<?", (int(time.time())-900,))
+            used_row = conn.execute("SELECT COALESCE(SUM(tokens),0) n FROM usage_ledger WHERE scope=? AND scope_id=? AND created_at>=?",(scope,scope_id,since)).fetchone()
+            reserved_scope = conn.execute("SELECT COALESCE(SUM(reserved_tokens-paid_reserved),0) n FROM usage_reservations WHERE scope=? AND scope_id=? AND created_at>=?",(scope,scope_id,since)).fetchone()
+            free_left = max(0, daily_limit-int(used_row["n"])-int(reserved_scope["n"]))
+            global_used = conn.execute("SELECT COALESCE(SUM(tokens),0) n FROM usage_ledger WHERE scope='global' AND created_at>=?",(since,)).fetchone()
+            global_reserved = conn.execute("SELECT COALESCE(SUM(reserved_tokens),0) n FROM usage_reservations WHERE created_at>=?",(since,)).fetchone()
+            if int(global_used["n"])+int(global_reserved["n"])+tokens > global_limit:
+                conn.rollback()
+                return False, "global"
+            paid_due=max(0,tokens-free_left)
+            if paid_due:
+                if user_id is None:
+                    conn.rollback()
+                    return False, "quota"
+                balance_row=conn.execute("SELECT tokens FROM token_balances WHERE user_id=?",(user_id,)).fetchone()
+                balance=int(balance_row["tokens"]) if balance_row else 0
+                pending=conn.execute("SELECT COALESCE(SUM(paid_reserved),0) n FROM usage_reservations WHERE user_id=? AND created_at>=?",(user_id,since)).fetchone()
+                if paid_due > balance-int(pending["n"]):
+                    conn.rollback()
+                    return False, "quota"
+            conn.execute("INSERT INTO usage_reservations(reservation_id,scope,scope_id,reserved_tokens,paid_reserved,user_id,created_at) VALUES(?,?,?,?,?,?,?)",(reservation_id,scope,scope_id,tokens,paid_due,user_id,int(time.time())))
+            conn.commit()
+            return True, ""
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def settle_reservation(self, reservation_id: str, tokens: int) -> tuple[bool, int]:
+        conn=self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            reservation=conn.execute("SELECT * FROM usage_reservations WHERE reservation_id=?",(reservation_id,)).fetchone()
+            if not reservation:
+                conn.rollback()
+                return False, 0
+            paid_free_capacity=max(0,int(reservation["reserved_tokens"])-int(reservation["paid_reserved"]))
+            paid_due=max(0,tokens-paid_free_capacity)
+            user_id=reservation["user_id"]
+            if paid_due:
+                balance_row=conn.execute("SELECT tokens FROM token_balances WHERE user_id=?",(user_id,)).fetchone()
+                balance=int(balance_row["tokens"]) if balance_row else 0
+                if paid_due>balance:
+                    conn.rollback()
+                    return False, paid_due
+                conn.execute("UPDATE token_balances SET tokens=tokens-? WHERE user_id=?",(paid_due,user_id))
+            timestamp=int(time.time())
+            conn.execute("INSERT INTO usage_ledger(scope,scope_id,tokens,created_at) VALUES(?,?,?,?)",(reservation["scope"],reservation["scope_id"],tokens,timestamp))
+            conn.execute("INSERT INTO usage_ledger(scope,scope_id,tokens,created_at) VALUES('global',0,?,?)",(tokens,timestamp))
+            conn.execute("DELETE FROM usage_reservations WHERE reservation_id=?",(reservation_id,))
+            conn.commit()
+            return True,paid_due
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def release_reservation(self, reservation_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM usage_reservations WHERE reservation_id=?",(reservation_id,))
+
+    def consume_usage(
+        self, scope: str, scope_id: int, tokens: int, daily_limit: int,
+        *, since: int, user_id: int | None = None, global_limit: int | None = None,
+    ) -> tuple[bool, int]:
+        """Atomically record usage and debit paid balance only above the free quota."""
+        if tokens <= 0:
+            return True, 0
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT COALESCE(SUM(tokens),0) AS used FROM usage_ledger "
+                "WHERE scope=? AND scope_id=? AND created_at>=?",
+                (scope, scope_id, since),
+            ).fetchone()
+            used = int(row["used"])
+            if global_limit is not None:
+                global_row = conn.execute("SELECT COALESCE(SUM(tokens),0) AS used FROM usage_ledger WHERE scope='global' AND created_at>=?", (since,)).fetchone()
+                if int(global_row["used"]) + tokens > global_limit:
+                    conn.rollback()
+                    return False, 0
+            paid_due = max(0, tokens - max(0, daily_limit - used))
+            balance = 0
+            if user_id is not None:
+                balance_row = conn.execute(
+                    "SELECT tokens FROM token_balances WHERE user_id=?", (user_id,)
+                ).fetchone()
+                balance = int(balance_row["tokens"]) if balance_row else 0
+            if paid_due > balance:
+                conn.rollback()
+                return False, paid_due
+            if paid_due:
+                conn.execute(
+                    "UPDATE token_balances SET tokens=tokens-? WHERE user_id=?",
+                    (paid_due, user_id),
+                )
+            timestamp = int(time.time())
+            conn.execute(
+                "INSERT INTO usage_ledger(scope,scope_id,tokens,created_at) VALUES(?,?,?,?)",
+                (scope, scope_id, tokens, timestamp),
+            )
+            if scope != "global":
+                conn.execute("INSERT INTO usage_ledger(scope,scope_id,tokens,created_at) VALUES('global',0,?,?)", (tokens, timestamp))
+            conn.commit()
+            return True, paid_due
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def usage_since(self, scope: str, scope_id: int, since: int) -> int:
         with self._connect() as conn:
@@ -379,16 +521,19 @@ class MemoryStore:
         return int(row["n"])
 
     def remember(self, chat_id: int, user_id: int, fact: str, retention_days: int = 30) -> None:
+        if not fact.strip() or len(fact) > 500:
+            raise ValueError("Saved facts must contain 1-500 characters")
         now = int(time.time())
         with self._connect() as conn:
             conn.execute("INSERT INTO saved_memories(chat_id,user_id,fact,created_at,expires_at) VALUES(?,?,?,?,?)",
                          (chat_id,user_id,fact,datetime.now(timezone.utc).isoformat(),now+retention_days*86400))
+            conn.execute("DELETE FROM saved_memories WHERE chat_id=? AND id NOT IN (SELECT id FROM saved_memories WHERE chat_id=? ORDER BY id DESC LIMIT 15)", (chat_id,chat_id))
 
     def fetch_memories(self, chat_id: int) -> list[dict[str, Any]]:
         now = int(time.time())
         with self._connect() as conn:
             conn.execute("DELETE FROM saved_memories WHERE expires_at<=?", (now,))
-            rows = conn.execute("SELECT id,user_id,fact,created_at FROM saved_memories WHERE chat_id=? AND expires_at>? ORDER BY id DESC",(chat_id,now)).fetchall()
+            rows = conn.execute("SELECT id,user_id,fact,created_at FROM saved_memories WHERE chat_id=? AND expires_at>? ORDER BY id DESC LIMIT 15",(chat_id,now)).fetchall()
         return [dict(row) for row in rows]
 
     def clear_memories(self, chat_id: int) -> None:
@@ -417,6 +562,8 @@ class MemoryStore:
             conn.execute("DELETE FROM chat_state")
             conn.execute("DELETE FROM usage_ledger WHERE created_at < ?", (int(time.time())-90*86400,))
             conn.execute("DELETE FROM saved_memories WHERE expires_at<=?",(int(time.time()),))
+            conn.execute("DELETE FROM star_purchases WHERE status='pending' AND created_at<?", (int(time.time())-30*86400,))
+            conn.execute("DELETE FROM usage_reservations WHERE created_at<?", (int(time.time())-900,))
 
     def clear_all_memory(self) -> None:
         with self._connect() as conn:

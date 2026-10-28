@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    container_name: tg-ai-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SQLITE_PATH: /app/data/bot_memory.sqlite3
+    volumes:
+      - bot_data:/app/data
+    init: true
+
+volumes:
+  bot_data:

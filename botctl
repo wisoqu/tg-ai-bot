@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+cd "$ROOT"
+if [ "${1:-}" = "setup" ]; then
+  exec python3 "$ROOT/manage.py" "$@"
+fi
+if [ ! -x "$ROOT/.venv/bin/python" ]; then
+  python3 "$ROOT/manage.py" install
+fi
+exec "$ROOT/.venv/bin/python" "$ROOT/manage.py" "$@"

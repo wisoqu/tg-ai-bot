@@ -25,16 +25,12 @@ class GeminiQuotaError(RuntimeError):
 
 class GeminiService:
     AUTO_MODEL = "auto"
+    # Auto mode intentionally stays on economical Flash-Lite models. It never
+    # silently falls back to a potentially billable Pro model.
     DEFAULT_AUTO_MODELS = [
-        "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemma-3-4b-it",
+        "gemini-3.1-flash-lite",
     ]
-
     def __init__(self, api_key: str, fallback_models: list[str] | None = None, api_keys: list[str] | None = None) -> None:
         self.api_keys = list(dict.fromkeys(api_keys or [api_key]))
         self._key_index = 0
@@ -46,7 +42,7 @@ class GeminiService:
         ]
         self._available_models: set[str] | None = None
         self._list_lock = asyncio.Lock()
-        self._cooldown_until: dict[str, float] = {}
+        self._cooldown_until: dict[tuple[int, str], float] = {}
 
     async def generate_from_messages(
         self,
@@ -68,7 +64,7 @@ class GeminiService:
             allow_fallbacks=allow_fallbacks,
         )
 
-    async def transcribe_audio(self, audio: bytes, mime_type: str, model: str = "gemini-2.5-flash-lite") -> GeminiResult:
+    async def transcribe_audio(self, audio: bytes, mime_type: str, model: str = "gemini-2.5-flash-lite", duration_seconds: int = 0) -> GeminiResult:
         part = types.Part.from_bytes(data=audio, mime_type=mime_type)
         last_error: Exception | None = None
         response = None
@@ -103,54 +99,67 @@ class GeminiService:
         allow_fallbacks: bool = True,
     ) -> GeminiResult:
         all_candidates = await self._build_candidate_models(model, allow_fallbacks)
-        candidate_models = self._filter_cooldown_models(all_candidates)
-
+        candidate_models = all_candidates
         if not candidate_models:
             raise GeminiQuotaError("No Gemini models are currently available")
 
         last_error: Exception | None = None
+        attempted = False
         for candidate_model in candidate_models:
-            try:
-                response = await self._generate_with_model(
-                    candidate_model=candidate_model,
-                    prompt=prompt,
-                    system_instruction=system_instruction,
-                    max_output_tokens=max_output_tokens,
-                    temperature=temperature,
-                )
-                text = (response.text or "").strip()
-                if text:
-                    usage = getattr(response, "usage_metadata", None)
-                    return GeminiResult(text=text, model=candidate_model,
-                        input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
-                        output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0) + int(getattr(usage, "thoughts_token_count", 0) or 0))
-            except errors.ClientError as exc:
-                if self._is_quota_error(exc):
-                    retry_seconds = self._parse_retry_seconds(exc)
-                    self._cooldown_until[candidate_model] = time.time() + retry_seconds
-                    LOGGER.warning(
-                        "Gemini model %s quota-limited, cooling down for %ss",
-                        candidate_model,
-                        retry_seconds,
-                    )
-                    last_error = exc
+            # A quota is per Google project, not per key, but a configured key may
+            # belong to another project. Retry the same economical model with each key.
+            key_attempts = len(self.api_keys)
+            for _ in range(key_attempts):
+                key_index = self._key_index
+                if self._cooldown_until.get((key_index, candidate_model), 0) > time.time():
                     self._rotate_key()
                     continue
-                if self._is_key_error(exc):
+                client = self.client  # stable for this request even if another task rotates keys
+                attempted = True
+                try:
+                    response = await self._generate_with_model(
+                        candidate_model=candidate_model, prompt=prompt,
+                        system_instruction=system_instruction,
+                        max_output_tokens=max_output_tokens, temperature=temperature,
+                        client=client,
+                    )
+                    text = (response.text or "").strip()
+                    if text:
+                        usage = getattr(response, "usage_metadata", None)
+                        return GeminiResult(
+                            text=text, model=candidate_model,
+                            input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
+                            output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0)
+                            + int(getattr(usage, "thoughts_token_count", 0) or 0),
+                        )
+                    last_error = RuntimeError(f"{candidate_model} returned empty output")
+                    break
+                except errors.ClientError as exc:
                     last_error = exc
-                    if self._rotate_key():
+                    if self._is_quota_error(exc):
+                        retry_seconds = self._parse_retry_seconds(exc)
+                        self._cooldown_until[(key_index, candidate_model)] = time.time() + retry_seconds
+                        LOGGER.warning("Gemini model %s quota-limited on key slot %s; cooldown %ss",
+                                       candidate_model, key_index + 1, retry_seconds)
+                        self._rotate_key()
                         continue
-                raise
-            except Exception as exc:
-                last_error = exc
-                if self._is_key_error(exc):
-                    self._rotate_key()
-                continue
+                    if self._is_key_error(exc):
+                        self._rotate_key()
+                        continue
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    if self._is_key_error(exc):
+                        self._rotate_key()
+                        continue
+                    break
 
         if last_error and self._is_quota_error(last_error):
             raise GeminiQuotaError("Gemini quota/rate limit exceeded") from last_error
         if last_error:
             raise RuntimeError("Gemini generation failed") from last_error
+        if not attempted:
+            raise GeminiQuotaError("All configured Gemini key/model pairs are in cooldown")
         raise RuntimeError("Gemini generation returned empty output")
 
     async def _generate_with_model(
@@ -161,7 +170,9 @@ class GeminiService:
         system_instruction: str | None,
         max_output_tokens: int,
         temperature: float,
+        client=None,
     ):
+        client = client or self.client
         config = self._build_generation_config(
             model_name=candidate_model,
             system_instruction=system_instruction,
@@ -170,7 +181,7 @@ class GeminiService:
             disable_thinking=True,
         )
         try:
-            return await self.client.aio.models.generate_content(
+            return await client.aio.models.generate_content(
                 model=candidate_model,
                 contents=prompt,
                 config=config,
@@ -184,7 +195,7 @@ class GeminiService:
                     temperature=temperature,
                     disable_thinking=False,
                 )
-                return await self.client.aio.models.generate_content(
+                return await client.aio.models.generate_content(
                     model=candidate_model,
                     contents=prompt,
                     config=fallback_config,
@@ -240,10 +251,8 @@ class GeminiService:
             if preferred in available:
                 resolved.append(preferred)
 
-        for name in sorted(available):
-            if (name.startswith("gemini-") or name.startswith("gemma-")) and name not in resolved:
-                resolved.append(name)
-
+        # Do not append every model visible to the key: that could silently pick
+        # a paid/pro model after an inexpensive model is rate-limited.
         return resolved or list(self.DEFAULT_AUTO_MODELS)
 
     async def _load_available_models(self) -> set[str]:
